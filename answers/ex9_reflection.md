@@ -4,28 +4,14 @@
 
 ### Your answer
 
-In my Ex7 run (session sess_a382a2149fc1), the planner's second
-subgoal was sg_2 "commit the booking under policy rules" with
-assigned_half: "structured". The signal that drove this was the task
-text naming a deterministic constraint — "under policy rules".
-Sovereign-agent's DefaultPlanner is prompted with the list of
-available halves and their purposes; when subgoal description
-mentions rules/policy/limits, the planner prefers structured.
+In session sess_be3d00d3a9db, the planner made an interesting decision. After the venue_search tool triggered its safety mechanism (following 4 failed attempts to find a venue matching the LLM's hallucinated parameters), the executor hit the STOP calling venue_search instruction. 
 
-This decision is advisory, not physical. The orchestrator respects
-it only because both halves are wired up. If only a loop half
-existed (as in research_assistant), a subgoal assigned to structured
-would go to the void. That's failure mode #4 from the course slides.
-
-The broader lesson: the planner makes an architectural decision
-based on prose interpretation. Put the rules somewhere the LLM
-cannot mis-assign — in the structured half's Python — and prose
-ambiguity no longer matters.
+The planner then called handoff_to_structured. The planner then attempted to hand off the "search attempts" data to the structured half trying to find a resolution. This shows that the "handoff bridge" works as a safety valve when an agent fails to work as expected.
 
 ### Citation
 
-- sessions/sess_a382a2149fc1/logs/tickets/tk_*/raw_output.json
-- sessions/sess_a382a2149fc1/logs/trace.jsonl:23
+- sessions/sess_be3d00d3a9db/logs/trace.jsonl
+- The venue_search summary in trace line 6: "STOP calling venue_search; use the results you already have."
 
 ---
 
@@ -33,47 +19,33 @@ ambiguity no longer matters.
 
 ### Your answer
 
-During Ex5 development my integrity check caught a subtle fabrication
-that manual review missed. In session sess_de44a1b8eb12 the flyer
-claimed "Total: £560" and "Deposit: £112" — plausible numbers that
-followed the deposit formula in catering.json. I skimmed and moved on.
+During my manual testing of Exercise 5, I followed the instructions to perform the "fabrication" on session sess_239b73852a7b, editing the flyer.html file to change the price to £9999. 
 
-verify_dataflow returned ok=False with unverified_facts=['£560','£112'].
-The trace showed calculate_cost returned total_gbp=540, deposit=0. The
-real total was £540 under the £300 deposit threshold. The LLM had
-written "£560" plausibly — close enough that a human reviewer wouldn't
-notice without cross-referencing.
+The verify_dataflow check correctly failed with ok=False and flagged ['£9999'] as an unverified fact. While in this specific case perhaps a human reviewer would notice the excessive price, the point is that the dataflow is able to keep track of facts and detect when they are not verified.
 
-The check caught it because it compared against ground truth in
-_TOOL_CALL_LOG, not against "does this look reasonable." The lesson
-generalises: if the validator would pass a human skim, plant a
-deliberately-weird value like £9999 and confirm it's caught.
+In this case all the facts in the citation are shown as unverified because the check performed with the python -c command does not have access to the session's memory, and therefore cannot verify the facts.
 
 ### Citation
 
-- sessions/sess_de44a1b8eb12/workspace/flyer.md:12
-- sessions/sess_de44a1b8eb12/logs/trace.jsonl:15
+```bash
+uv run python -c "
+from starter.edinburgh_research.integrity import verify_dataflow
+from pathlib import Path
+result = verify_dataflow(Path('$(make logs)/workspace/flyer.html').read_tex
+t())
+print(result.summary)
+"
+dataflow FAIL: 4 unverified fact(s): ['£9999', '£0', '12', 'cloudy']
+```
 
 ---
 
-## Q3 — Removing one framework primitive
+## Q3 — Expected production failure
 
 ### Your answer
 
-I'd keep session directories (Decision 1) as the last thing standing
-and rebuild everything else if forced. The forward-only state machine
-(Decision 2) is important but fragile without directories. Tickets
-(Decision 3) I could rebuild as .jsonl files inside the session.
-Atomic-rename IPC (Decision 5) is replaceable by directory polling.
-
-Session directories are the irreplaceable piece. Losing them:
-cross-tenant data leaks, reconstructing per-run state from logs,
-"how did this session end up this way" becomes SQL archaeology
-instead of cat. The slides compare it to git commits being the
-foundation — you can rebuild merge, diff, blame from commits but
-not commits from the rest. Session directories are commits.
+The first production failure I'd expect is a "hallucinated commitment," where the LLM persona accepts an impossible booking (like a negative party size or a non-existent date) to stay in character. I saw this in my Ex8 interaction with the Alasdair persona in session sess_069600fbf662. When I requested a booking for "-2 people," the persona this was evidently understood as "two people" and the response was "Aye, we can do that... I'll pencil you in."
 
 ### Citation
 
-- sessions/sess_de44a1b8eb12/ — the directory itself
-- sessions/sess_a382a2149fc1/logs/trace.jsonl
+- sessions/sess_069600fbf662/logs/trace.jsonl
