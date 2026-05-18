@@ -14,10 +14,14 @@ The grader checks for:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
+from sovereign_agent.errors import ToolError
 from sovereign_agent.session.directory import Session
 from sovereign_agent.tools.registry import ToolRegistry, ToolResult, _RegisteredTool
+
+from .integrity import _TOOL_CALL_LOG, record_tool_call
 
 _SAMPLE_DATA = Path(__file__).parent / "sample_data"
 
@@ -41,9 +45,56 @@ def venue_search(near: str, party_size: int, budget_max_gbp: int = 1000) -> Tool
     MUST call record_tool_call(...) before returning so the integrity
     check can see what data was produced.
     """
-    # TODO 1a: load venues.json. Raise ToolError(SA_TOOL_DEPENDENCY_MISSING)
-    #          if the file is absent.
-    raise NotImplementedError("TODO 1: implement venue_search")
+    search_count = sum(1 for r in _TOOL_CALL_LOG if r.tool_name == "venue_search")
+    if search_count >= 3:
+        return ToolResult(
+            success=False,
+            output={"error": "too_many_searches", "count": search_count},
+            summary="STOP calling venue_search; use the results you already have.",
+        )
+
+    path = _SAMPLE_DATA / "venues.json"
+    if not path.exists():
+        raise ToolError(
+            code="SA_TOOL_DEPENDENCY_MISSING",
+            message=f"Missing fixture: {path}",
+        )
+
+    with path.open() as f:
+        venues = json.load(f)
+
+    results = []
+    near_lower = near.lower()
+    for v in venues:
+        if not v.get("open_now", False):
+            continue
+        area = v.get("area", "").lower()
+        address = v.get("address", "").lower()
+        if near_lower not in area and area not in near_lower and near_lower not in address:
+            continue
+        if v.get("seats_available_evening", 0) < party_size:
+            continue
+        if v.get("hire_fee_gbp", 0) + v.get("min_spend_gbp", 0) > budget_max_gbp:
+            continue
+        results.append(v)
+
+    output = {
+        "near": near,
+        "party_size": party_size,
+        "results": results,
+        "count": len(results),
+    }
+    record_tool_call(
+        "venue_search",
+        {"near": near, "party_size": party_size, "budget_max_gbp": budget_max_gbp},
+        output,
+    )
+
+    return ToolResult(
+        success=True,
+        output=output,
+        summary=f"venue_search({near}, party={party_size}): {len(results)} result(s)",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +112,40 @@ def get_weather(city: str, date: str) -> ToolResult:
 
     MUST call record_tool_call(...) before returning.
     """
-    raise NotImplementedError("TODO 2: implement get_weather")
+    path = _SAMPLE_DATA / "weather.json"
+    if not path.exists():
+        raise ToolError(
+            code="SA_TOOL_DEPENDENCY_MISSING",
+            message=f"Missing fixture: {path}",
+        )
+
+    with path.open() as f:
+        weather_data = json.load(f)
+
+    city_key = city.lower()
+    if city_key not in weather_data or date not in weather_data[city_key]:
+        err = ToolError(
+            code="SA_TOOL_INVALID_INPUT",
+            message=f"City '{city}' or date '{date}' not found in fixtures.",
+        )
+        return ToolResult(
+            success=False,
+            output={},
+            summary=f"get_weather({city}, {date}): city or date not found in fixtures",
+            error=err,
+        )
+
+    output = weather_data[city_key][date]
+    output["city"] = city
+    output["date"] = date
+
+    record_tool_call("get_weather", {"city": city, "date": date}, output)
+
+    return ToolResult(
+        success=True,
+        output=output,
+        summary=f"get_weather({city}, {date}): {output['condition']}, {output['temperature_c']}C",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +182,86 @@ def calculate_cost(
 
     MUST call record_tool_call(...) before returning.
     """
-    raise NotImplementedError("TODO 3: implement calculate_cost")
+    catering_path = _SAMPLE_DATA / "catering.json"
+    venues_path = _SAMPLE_DATA / "venues.json"
+
+    if not catering_path.exists() or not venues_path.exists():
+        raise ToolError(
+            code="SA_TOOL_DEPENDENCY_MISSING",
+            message="Missing catering or venues fixture",
+        )
+
+    with catering_path.open() as f:
+        catering = json.load(f)
+    with venues_path.open() as f:
+        venues = json.load(f)
+
+    venue = next((v for v in venues if v["id"] == venue_id), None)
+    if not venue:
+        return ToolResult(
+            success=False,
+            output={},
+            summary=f"calculate_cost: venue {venue_id} not found",
+        )
+
+    base_rates = catering["base_rates_gbp_per_head"]
+    venue_modifiers = catering["venue_modifiers"]
+    service_charge_pct = catering["service_charge_percent"]
+
+    if catering_tier not in base_rates:
+        return ToolResult(
+            success=False,
+            output={},
+            summary=f"calculate_cost: invalid catering tier {catering_tier}",
+        )
+
+    base_per_head = base_rates[catering_tier]
+    venue_mult = venue_modifiers.get(venue_id, 1.0)
+
+    subtotal = int(base_per_head * venue_mult * party_size * max(1, duration_hours))
+    service = int(subtotal * service_charge_pct / 100)
+
+    venue_floor = venue.get("hire_fee_gbp", 0) + venue.get("min_spend_gbp", 0)
+    total = subtotal + service + venue_floor
+
+    # Deposit policy
+    # under_gbp_300: no_deposit_required
+    # gbp_300_to_1000: deposit_20_percent
+    # over_gbp_1000: deposit_30_percent
+    if total < 300:
+        deposit = 0
+    elif total <= 1000:
+        deposit = int(total * 0.2)
+    else:
+        deposit = int(total * 0.3)
+
+    output = {
+        "venue_id": venue_id,
+        "party_size": party_size,
+        "duration_hours": duration_hours,
+        "catering_tier": catering_tier,
+        "subtotal_gbp": subtotal,
+        "service_gbp": service,
+        "total_gbp": total,
+        "deposit_required_gbp": deposit,
+    }
+
+    record_tool_call(
+        "calculate_cost",
+        {
+            "venue_id": venue_id,
+            "party_size": party_size,
+            "duration_hours": duration_hours,
+            "catering_tier": catering_tier,
+        },
+        output,
+    )
+
+    return ToolResult(
+        success=True,
+        output=output,
+        summary=f"calculate_cost({venue_id}, {party_size}): total £{total}, deposit £{deposit}",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +289,103 @@ def generate_flyer(session: Session, event_details: dict) -> ToolResult:
     IMPORTANT: this tool MUST be registered with parallel_safe=False
     because it writes a file.
     """
-    raise NotImplementedError("TODO 4: implement generate_flyer")
+    # Fetch recent data from logs to tolerate LLM omissions
+    weather_calls = [r for r in _TOOL_CALL_LOG if r.tool_name == "get_weather"]
+    cost_calls = [r for r in _TOOL_CALL_LOG if r.tool_name == "calculate_cost"]
+    search_calls = [r for r in _TOOL_CALL_LOG if r.tool_name == "venue_search"]
+
+    w_out = weather_calls[-1].output if weather_calls else {}
+    c_out = cost_calls[-1].output if cost_calls else {}
+
+    vid = c_out.get("venue_id")
+    v_info = {}
+    for sc in search_calls:
+        for v in sc.output.get("results", []):
+            if v["id"] == vid:
+                v_info = v
+                break
+
+    venue_name = event_details.get("venue_name") or v_info.get("name", "Unknown Venue")
+    venue_address = event_details.get("venue_address") or v_info.get("address", "Unknown Address")
+    date = event_details.get("date") or w_out.get("date", "Unknown Date")
+    time = event_details.get("time") or "19:30"
+    party_size = event_details.get("party_size") or c_out.get("party_size", 0)
+    condition = event_details.get("condition") or w_out.get("condition", "Unknown")
+    temp = event_details.get("temperature_c")
+    if temp is None:
+        temp = w_out.get("temperature_c", 0)
+    total = event_details.get("total_gbp")
+    if total is None:
+        total = c_out.get("total_gbp", 0)
+    deposit = event_details.get("deposit_required_gbp")
+    if deposit is None:
+        deposit = c_out.get("deposit_required_gbp", 0)
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        body {{ font-family: sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 20px auto; padding: 20px; border: 1px solid #ccc; border-radius: 8px; }}
+        h1 {{ color: #2c3e50; border-bottom: 2px solid #2c3e50; padding-bottom: 10px; }}
+        .fact {{ margin-bottom: 15px; }}
+        .label {{ font-weight: bold; color: #7f8c8d; min-width: 120px; display: inline-block; }}
+        .value {{ color: #2980b9; }}
+        .weather {{ background: #ecf0f1; padding: 15px; border-radius: 4px; margin-top: 20px; }}
+        .cost {{ background: #fef9e7; padding: 15px; border-radius: 4px; border-left: 5px solid #f1c40f; margin-top: 20px; }}
+    </style>
+</head>
+<body>
+    <h1>Event Flyer: <span data-testid="venue_name">{venue_name}</span></h1>
+
+    <div class="fact">
+        <span class="label">Location:</span>
+        <span class="value" data-testid="venue_address">{venue_address}</span>
+    </div>
+
+    <div class="fact">
+        <span class="label">Date:</span>
+        <span class="value" data-testid="date">{date}</span>
+    </div>
+
+    <div class="fact">
+        <span class="label">Time:</span>
+        <span class="value" data-testid="time">{time}</span>
+    </div>
+
+    <div class="fact">
+        <span class="label">Party Size:</span>
+        <span class="value" data-testid="party_size">{party_size}</span>
+    </div>
+
+    <div class="weather">
+        <h3>Weather Report</h3>
+        <p>Condition: <span data-testid="condition">{condition}</span></p>
+        <p>Temperature: <span data-testid="temperature_c">{temp}</span>°C</p>
+    </div>
+
+    <div class="cost">
+        <h3>Cost Breakdown</h3>
+        <p>Total Cost: <span data-testid="total_gbp">£{total}</span></p>
+        <p>Deposit Required: <span data-testid="deposit_required_gbp">£{deposit}</span></p>
+    </div>
+</body>
+</html>"""
+    workspace_path = session.workspace_dir / "flyer.html"
+    workspace_path.parent.mkdir(parents=True, exist_ok=True)
+    workspace_path.write_text(html, encoding="utf-8")
+
+    output = {
+        "path": "workspace/flyer.html",
+        "bytes_written": len(html),
+    }
+
+    record_tool_call("generate_flyer", {"event_details": event_details}, output)
+
+    return ToolResult(
+        success=True,
+        output=output,
+        summary=f"generate_flyer: wrote {output['path']} ({output['bytes_written']} chars)",
+    )
 
 
 # ---------------------------------------------------------------------------
